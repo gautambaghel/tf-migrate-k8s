@@ -1,0 +1,10 @@
+# Kubernetes provider address overrides for migration.
+# Format: old_address=new_address
+#
+# These entries are checked before type-based inference.
+# Use this when a local name changes or module-scoped addresses
+# need a precise target during migration.
+
+# Example:
+# kubernetes_config_map.example=kubernetes_config_map_v1.example
+# module.platform.kubernetes_service.api=module.platform.kubernetes_service_v1.api
