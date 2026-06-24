@@ -45,6 +45,27 @@ Options:
   --skip-plan           Skip terraform plan after config changes.
   --dry-run             Print the commands without executing them.
   -h, --help            Show this help message.
+
+HCP Terraform / Terraform Enterprise (via the tfctl CLI):
+  This migration is config-based (removed/import blocks), so it never mutates
+  local state and works with workspaces whose state lives in HCP Terraform or
+  Terraform Enterprise. When a cloud {} or remote backend block is present,
+  pass --use-tfctl to verify the migration remotely with tfctl instead of (or
+  in addition to) a local terraform plan.
+
+  --use-tfctl           Verify against HCP Terraform / Terraform Enterprise with
+                        tfctl. Requires the tfctl CLI; terraform becomes optional.
+  --tfc-workspace NAME  Target workspace name. Defaults to the name in the
+                        cloud/remote backend block, or tfctl's own resolution.
+  --tfc-organization NAME
+                        Organization name. Defaults to the cloud block value or
+                        the active tfctl profile / TFCTL_ORGANIZATION.
+  --tfc-hostname HOST   HCP Terraform / TFE hostname. Defaults to the cloud block
+                        value or the active tfctl profile / TFCTL_HOSTNAME.
+  --tfc-start-run       Start a remote run with tfctl after preparing config.
+                        The run uses the latest uploaded configuration version,
+                        so push (VCS) or upload (CLI plan) the migrated config first.
+  --tfc-message MSG     Message to attach to the tfctl run.
 EOF
 }
 
@@ -59,6 +80,19 @@ skip_plan=0
 dry_run=0
 provider_version_bumped=0
 config_rewritten=0
+use_tfctl=0
+tfc_workspace=""
+tfc_organization=""
+tfc_hostname=""
+tfc_start_run=0
+tfc_message=""
+tfc_detected=0
+tfc_detected_org=""
+tfc_detected_hostname=""
+tfc_detected_workspace=""
+terraform_available=0
+tfctl_ctx_org=""
+tfctl_ctx_host=""
 
 declare -a candidates_file
 candidates_file=""
@@ -99,6 +133,30 @@ while [[ $# -gt 0 ]]; do
     --skip-plan)
       skip_plan=1
       shift
+      ;;
+    --use-tfctl)
+      use_tfctl=1
+      shift
+      ;;
+    --tfc-workspace)
+      tfc_workspace="$2"
+      shift 2
+      ;;
+    --tfc-organization)
+      tfc_organization="$2"
+      shift 2
+      ;;
+    --tfc-hostname)
+      tfc_hostname="$2"
+      shift 2
+      ;;
+    --tfc-start-run)
+      tfc_start_run=1
+      shift
+      ;;
+    --tfc-message)
+      tfc_message="$2"
+      shift 2
       ;;
     --dry-run)
       dry_run=1
@@ -145,8 +203,19 @@ else
   fi
 fi
 
-if ! command -v terraform >/dev/null 2>&1; then
+if command -v terraform >/dev/null 2>&1; then
+  terraform_available=1
+fi
+
+if [[ $use_tfctl -eq 1 ]]; then
+  if ! command -v tfctl >/dev/null 2>&1; then
+    echo "tfctl is required with --use-tfctl but was not found in PATH" >&2
+    echo "Install it from https://github.com/hashicorp/tfctl-cli (e.g. brew install hashicorp/tap/tfctl)." >&2
+    exit 1
+  fi
+elif [[ $terraform_available -eq 0 ]]; then
   echo "terraform is required but was not found in PATH" >&2
+  echo "Install terraform, or pass --use-tfctl to verify against HCP Terraform / Terraform Enterprise with tfctl." >&2
   exit 1
 fi
 
@@ -163,6 +232,144 @@ run_cmd() {
   else
     "$@"
   fi
+}
+
+# Run tfctl with the resolved organization/hostname context, honoring --dry-run.
+run_tfctl() {
+  if [[ $dry_run -eq 1 ]]; then
+    {
+      printf '[dry-run]'
+      printf ' %q' tfctl "$@"
+      printf '\n'
+    } >&2
+    return 0
+  fi
+  (
+    [[ -n "${tfctl_ctx_org:-}" ]] && export TFCTL_ORGANIZATION="$tfctl_ctx_org"
+    [[ -n "${tfctl_ctx_host:-}" ]] && export TFCTL_HOSTNAME="$tfctl_ctx_host"
+    tfctl "$@"
+  )
+}
+
+# Return success when the given Terraform version can use removed/import blocks.
+# import blocks need >= 1.5; removed blocks need >= 1.7. Unknown versions pass.
+tf_version_supports_removed() {
+  local v="$1"
+  v="${v#v}"
+  local major="${v%%.*}"
+  local rest="${v#*.}"
+  local minor="${rest%%.*}"
+  [[ "$major" =~ ^[0-9]+$ ]] || return 0
+  [[ "$minor" =~ ^[0-9]+$ ]] || return 0
+  if (( major > 1 )); then
+    return 0
+  fi
+  if (( major == 1 && minor >= 7 )); then
+    return 0
+  fi
+  return 1
+}
+
+# Detect an HCP Terraform / Terraform Enterprise integration (cloud {} or
+# remote backend) and capture organization, hostname, and workspace name.
+detect_cloud_backend() {
+  local parsed
+  parsed="$(find . -type f -name '*.tf' -print0 2>/dev/null | xargs -0 awk '
+    BEGIN { depth = 0; in_block = 0; block_depth = -1; in_ws = 0; ws_depth = -1; org = ""; host = ""; ws = "" }
+    function opens(s, i, c, n) { n = 0; for (i = 1; i <= length(s); i++) { c = substr(s, i, 1); if (c == "{") n++ } return n }
+    function closes(s, i, c, n) { n = 0; for (i = 1; i <= length(s); i++) { c = substr(s, i, 1); if (c == "}") n++ } return n }
+    function unquote(s) { sub(/^[^"]*"/, "", s); sub(/".*$/, "", s); return s }
+    {
+      line = $0
+      if (in_block == 0 && (line ~ /^[[:space:]]*cloud[[:space:]]*{[[:space:]]*$/ || line ~ /^[[:space:]]*backend[[:space:]]+"remote"[[:space:]]*{[[:space:]]*$/)) {
+        in_block = 1
+        block_depth = depth + 1
+      }
+      if (in_block == 1) {
+        if (line ~ /^[[:space:]]*organization[[:space:]]*=[[:space:]]*"[^"]+"/) { org = unquote(line) }
+        if (line ~ /^[[:space:]]*hostname[[:space:]]*=[[:space:]]*"[^"]+"/) { host = unquote(line) }
+        if (in_ws == 0 && line ~ /^[[:space:]]*workspaces[[:space:]]*{[[:space:]]*$/) { in_ws = 1; ws_depth = depth + 1 }
+        if (in_ws == 1 && line ~ /^[[:space:]]*name[[:space:]]*=[[:space:]]*"[^"]+"/) { ws = unquote(line) }
+        if (ws == "" && line ~ /workspaces[[:space:]]*{[^}]*name[[:space:]]*=[[:space:]]*"[^"]+"/) {
+          x = line
+          sub(/^.*name[[:space:]]*=[[:space:]]*"/, "", x)
+          sub(/".*$/, "", x)
+          ws = x
+        }
+      }
+      depth += opens(line) - closes(line)
+      if (in_ws == 1 && depth < ws_depth) { in_ws = 0; ws_depth = -1 }
+      if (in_block == 1 && depth < block_depth) { in_block = 0; block_depth = -1 }
+    }
+    END { if (org != "" || host != "" || ws != "") print org "|" host "|" ws }
+  ' 2>/dev/null | head -n 1)"
+
+  if [[ -n "$parsed" ]]; then
+    tfc_detected=1
+    IFS='|' read -r tfc_detected_org tfc_detected_hostname tfc_detected_workspace <<< "$parsed"
+  fi
+}
+
+# Verify the migration against HCP Terraform / Terraform Enterprise via tfctl.
+verify_with_tfctl() {
+  local ws="$1"
+
+  echo "== HCP Terraform / Terraform Enterprise verification (tfctl) ==" >&2
+
+  tfctl_ctx_org="${tfc_organization:-$tfc_detected_org}"
+  tfctl_ctx_host="${tfc_hostname:-$tfc_detected_hostname}"
+
+  [[ -n "$tfctl_ctx_org" ]] && echo "Organization: ${tfctl_ctx_org}" >&2
+  [[ -n "$tfctl_ctx_host" ]] && echo "Hostname: ${tfctl_ctx_host}" >&2
+
+  if [[ $dry_run -eq 1 ]]; then
+    echo "[dry-run] Would verify authentication: tfctl auth status" >&2
+  elif ! run_tfctl auth status >&2; then
+    echo "tfctl is not authenticated for this host. Run 'tfctl auth login' or set TFCTL_TOKEN, then retry." >&2
+    return 1
+  fi
+
+  if [[ -z "$ws" ]]; then
+    echo "No workspace resolved from configuration or flags." >&2
+    echo "Pass --tfc-workspace NAME (or add workspaces { name = \"...\" } to the cloud block) to enable run verification." >&2
+    return 0
+  fi
+
+  echo "Workspace: ${ws}" >&2
+
+  # Warn when the workspace Terraform version cannot use removed/import blocks.
+  if [[ $dry_run -eq 0 && -n "$tfctl_ctx_org" ]]; then
+    local ws_tf_version=""
+    ws_tf_version="$(
+      [[ -n "$tfctl_ctx_org" ]] && export TFCTL_ORGANIZATION="$tfctl_ctx_org"
+      [[ -n "$tfctl_ctx_host" ]] && export TFCTL_HOSTNAME="$tfctl_ctx_host"
+      tfctl api "/organizations/{organization}/workspaces/${ws}" --jq '.data.attributes."terraform-version"' 2>/dev/null
+    )" || ws_tf_version=""
+    if [[ -n "$ws_tf_version" ]]; then
+      echo "Workspace Terraform version: ${ws_tf_version}" >&2
+      if ! tf_version_supports_removed "$ws_tf_version"; then
+        echo "Warning: import blocks require Terraform >= 1.5 and removed blocks require >= 1.7." >&2
+        echo "Update the workspace Terraform version before applying this migration." >&2
+      fi
+    fi
+  fi
+
+  # Optionally start a run, then always report the latest run status.
+  if [[ $tfc_start_run -eq 1 ]]; then
+    local msg="${tfc_message:-Kubernetes versioned-resource migration}"
+    echo "Starting a run on '${ws}'. The run uses the latest configuration version in the workspace," >&2
+    echo "so push your committed changes (VCS) or run a CLI plan first to upload the migrated config." >&2
+    run_tfctl run start "$ws" --message="$msg" >&2 || return 1
+  fi
+
+  if [[ $dry_run -eq 1 ]]; then
+    echo "[dry-run] Would check latest run: tfctl run status ${ws}" >&2
+  else
+    run_tfctl run status "$ws" >&2 || true
+  fi
+
+  echo "Confirm the plan in HCP Terraform shows imports only (0 to destroy) before applying." >&2
+  return 0
 }
 
 is_versioned_type() {
@@ -618,7 +825,9 @@ if [[ $skip_config_rewrite -eq 0 ]]; then
 fi
 
 if [[ $provider_version_bumped -eq 1 ]]; then
-  if [[ $dry_run -eq 1 ]]; then
+  if [[ $terraform_available -eq 0 ]]; then
+    echo "Skipping terraform init -upgrade: terraform not found in PATH (the remote run will refresh provider selections)." >&2
+  elif [[ $dry_run -eq 1 ]]; then
     echo "[dry-run] Would run terraform init -upgrade to refresh provider lock selections" >&2
   else
     echo "Running terraform init -upgrade to refresh provider lock selections" >&2
@@ -701,8 +910,25 @@ else
   append_migration_blocks "./main.tf" "$old_address" "$new_address" "$import_id"
 fi
 
-if [[ $skip_plan -eq 0 ]]; then
+detect_cloud_backend
+if [[ $tfc_detected -eq 1 ]]; then
+  echo "Detected HCP Terraform / Terraform Enterprise integration (cloud or remote backend)." >&2
+  echo "State lives in the remote workspace; this config-based migration leaves it untouched." >&2
+fi
+
+if [[ $skip_plan -eq 1 ]]; then
+  :
+elif [[ $use_tfctl -eq 1 ]]; then
+  verify_with_tfctl "${tfc_workspace:-$tfc_detected_workspace}" || \
+    echo "tfctl verification reported an issue (see messages above). The configuration changes are still in place." >&2
+  if [[ $terraform_available -eq 1 && $tfc_detected -eq 1 ]]; then
+    echo "Running terraform plan (remote speculative plan of the migrated configuration)." >&2
+    run_cmd terraform plan -no-color || true
+  fi
+elif [[ $terraform_available -eq 1 ]]; then
   run_cmd terraform plan -no-color
+else
+  echo "Skipping verification: terraform not found and --use-tfctl not set." >&2
 fi
 
 rm -f "$candidates_file"

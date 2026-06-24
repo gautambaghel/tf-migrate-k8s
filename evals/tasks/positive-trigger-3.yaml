@@ -1,0 +1,19 @@
+id: positive-trigger-003
+name: Provider 3.0 upgrade with versioned resources
+description: General provider-3.0 upgrade mentioning versioned resource names.
+tags:
+  - positive-trigger
+inputs:
+  prompt: >-
+    We're moving the Terraform Kubernetes provider to 3.0. All the unversioned
+    resources need to become their _v1 versioned equivalents without recreating
+    anything. What's the safe path?
+expected:
+  should_trigger: true
+graders:
+  - type: trigger
+    name: should-activate
+    config:
+      skill_path: SKILL.md
+      mode: positive
+      threshold: 0.6

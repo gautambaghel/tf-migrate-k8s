@@ -1,0 +1,20 @@
+name: tf-migrate-k8s-eval
+description: >-
+  Trigger-precision eval for the tf-migrate-k8s skill. Verifies the skill
+  activates on realistic Kubernetes provider v3 migration prompts and stays
+  silent on unrelated provider work.
+skill: tf-migrate-k8s
+version: "1.0"
+config:
+  trials_per_task: 1
+  timeout_seconds: 300
+  parallel: true
+  executor: copilot-sdk
+  model: claude-sonnet-4.6
+metrics:
+  - name: trigger_accuracy
+    weight: 1.0
+    threshold: 0.8
+    description: Did the skill activate on the right prompts and stay silent otherwise?
+tasks:
+  - "tasks/*.yaml"

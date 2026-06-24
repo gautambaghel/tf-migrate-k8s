@@ -1,0 +1,18 @@
+id: negative-trigger-002
+name: Non-Kubernetes provider upgrade
+description: An AWS provider upgrade is unrelated and should not activate the skill.
+tags:
+  - negative-trigger
+inputs:
+  prompt: >-
+    Upgrade my AWS provider to the latest 5.x version and fix any deprecation
+    warnings that show up in terraform plan.
+expected:
+  should_trigger: false
+graders:
+  - type: trigger
+    name: should-not-activate
+    config:
+      skill_path: SKILL.md
+      mode: negative
+      threshold: 0.6

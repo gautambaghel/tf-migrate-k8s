@@ -1,0 +1,19 @@
+id: positive-trigger-002
+name: Rename to versioned names on HCP Terraform
+description: Explicit versioned-rename request with remote state that should activate the skill.
+tags:
+  - positive-trigger
+inputs:
+  prompt: >-
+    Rename my kubernetes_config_map and kubernetes_secret resources to the
+    versioned _v1 names in Terraform and move state over cleanly. Our state lives
+    in HCP Terraform.
+expected:
+  should_trigger: true
+graders:
+  - type: trigger
+    name: should-activate
+    config:
+      skill_path: SKILL.md
+      mode: positive
+      threshold: 0.6

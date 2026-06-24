@@ -1,0 +1,17 @@
+# Waza project configuration for the tf-migrate-k8s skill.
+# https://github.com/microsoft/waza
+
+tokens:
+  warningThreshold: 2500
+  fallbackLimit: 2000
+  limits:
+    defaults:
+      # SKILL.md carries a spec-required, trigger-rich USE FOR / DO NOT USE FOR
+      # routing description (~150 tokens). 700 keeps the body lean while leaving
+      # room for that description; all procedural detail lives in references/.
+      "SKILL.md": 700
+      "references/**/*.md": 1000
+      "references/*.md": 1000
+      "*.md": 2000
+    overrides:
+      "README.md": 3000

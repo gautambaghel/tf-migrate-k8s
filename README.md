@@ -41,9 +41,12 @@ the inferred import IDs before applying.
 
 ## Requirements
 
-- `terraform` available in `PATH`
+- `terraform` available in `PATH` (optional when using `--use-tfctl`; see below)
 - `awk`, `find`, `grep`, `sed`, and standard Unix shell utilities
+- `bash` 4 or newer
 - Terraform configuration already checked out locally
+- For HCP Terraform / Terraform Enterprise verification: the
+  [`tfctl` CLI](https://github.com/hashicorp/tfctl-cli)
 
 ## Quick start
 
@@ -126,6 +129,72 @@ currently appended to `main.tf`.
 --dry-run                     Print actions without executing them.
 ```
 
+## HCP Terraform and Terraform Enterprise
+
+This migration is config-based: it edits `.tf` files and adds `removed` and
+`import` blocks, and it never runs `terraform state` or touches a local state
+file. Because HCP Terraform and Terraform Enterprise (TFE) keep state inside the
+remote workspace, the migration is safe there by design — the workspace's state
+is only updated when the migrated configuration is applied through a run.
+
+When a `cloud {}` block or a `backend "remote"` block is present, the script
+detects it automatically and reports the resolved organization, hostname, and
+workspace.
+
+### Verifying with the tfctl CLI
+
+[`tfctl`](https://github.com/hashicorp/tfctl-cli) is the official CLI for HCP
+Terraform and Terraform Enterprise. Pass `--use-tfctl` to verify the migration
+against the remote workspace:
+
+```bash
+scripts/migrate-kubernetes-versioned-resource.sh \
+  --auto-discover \
+  --use-tfctl
+```
+
+With `--use-tfctl` the script:
+
+- requires the `tfctl` CLI (install with `brew install hashicorp/tap/tfctl`);
+  `terraform` becomes optional, so the migration can run in environments that
+  only have `tfctl`
+- checks authentication with `tfctl auth status` (run `tfctl auth login` or set
+  `TFCTL_TOKEN` first)
+- warns if the workspace's Terraform version is too old for the generated
+  blocks (`import` requires Terraform >= 1.5, `removed` requires >= 1.7)
+- reports the latest run with `tfctl run status`, and can start a run with
+  `--tfc-start-run`
+- still runs a local `terraform plan` when `terraform` is available, which
+  produces a remote speculative plan of the migrated configuration
+
+Because `tfctl run start` uses the latest configuration version already uploaded
+to the workspace, push your committed changes (VCS-driven workflow) or run a CLI
+plan (CLI-driven workflow) so the run evaluates the migrated config.
+
+### tfctl options
+
+```text
+--use-tfctl                   Verify against HCP Terraform / TFE with tfctl.
+--tfc-workspace NAME          Workspace name. Defaults to the name in the
+                              cloud/remote block, or tfctl's own resolution.
+--tfc-organization NAME       Organization. Defaults to the cloud block value or
+                              the active tfctl profile / TFCTL_ORGANIZATION.
+--tfc-hostname HOST           HCP Terraform / TFE hostname. Defaults to the cloud
+                              block value or the profile / TFCTL_HOSTNAME.
+--tfc-start-run               Start a remote run with tfctl after editing config.
+--tfc-message MSG             Message to attach to the tfctl run.
+```
+
+Configure the target instance and credentials with `tfctl` before running:
+
+```bash
+# HCP Terraform (default host app.terraform.io) or a TFE instance
+tfctl profile set hostname tfe.example.com
+tfctl profile set default_organization my-org
+tfctl auth login
+```
+
+
 ## Mapping files
 
 The repository includes two mapping inputs under `scripts/`:
@@ -164,7 +233,11 @@ instruction surface; the shell script in `scripts/` is the executable surface.
 1. Run `--auto-discover --discover-only --dry-run` and review the candidates.
 2. Add any needed explicit overrides to
 	 `scripts/kubernetes-versioned-address-map.txt`.
-3. Run `--auto-discover` to apply the config changes.
+3. Run `--auto-discover` to apply the config changes. Add `--use-tfctl` when the
+   workspace lives in HCP Terraform or Terraform Enterprise.
 4. Review the Terraform diff.
-5. Run `terraform plan` and confirm there are imports only.
-6. Apply through your normal Terraform workflow.
+5. Verify the plan and confirm there are imports only:
+   - Local or CLI-driven: run `terraform plan`.
+   - HCP Terraform / TFE: inspect the run with `tfctl run status` (or pass
+     `--tfc-start-run`), and confirm `0 to destroy` in the HCP Terraform UI.
+6. Apply through your normal Terraform workflow (or approve the remote run).
